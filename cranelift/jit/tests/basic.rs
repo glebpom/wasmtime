@@ -215,3 +215,203 @@ fn empty_data_object() {
     data.define(Box::new([]));
     module.define_data(data_id, &data).unwrap();
 }
+
+/// Reproduces a bug where a `call` between two functions of the same module
+/// that happen to be placed further than ±2 GiB apart panicked while applying
+/// the `X86CallPCRel4` relocation instead of routing the call through a
+/// veneer.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn far_x86_call_uses_veneer() {
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
+    use std::io;
+    use std::mem;
+    use std::ptr;
+
+    use cranelift_codegen::binemit::Reloc;
+
+    /// A large (a bit more than 4 GiB) virtual memory reservation that
+    /// executable allocations are carved out of, so that two functions can
+    /// deterministically be placed out of `rel32` range of each other.
+    struct ReservedAddressSpace {
+        base: usize,
+        len: usize,
+        page_size: usize,
+    }
+
+    impl ReservedAddressSpace {
+        fn new() -> Self {
+            let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            let len = (i32::MAX as usize)
+                .checked_mul(2)
+                .and_then(|size| size.checked_add(16 * 1024 * 1024))
+                .unwrap()
+                .next_multiple_of(page_size);
+            let mapping = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED);
+            Self {
+                base: mapping.addr(),
+                len,
+                page_size,
+            }
+        }
+    }
+
+    impl Drop for ReservedAddressSpace {
+        fn drop(&mut self) {
+            let result = unsafe { libc::munmap(self.base as *mut libc::c_void, self.len) };
+            assert_eq!(result, 0);
+        }
+    }
+
+    /// A memory provider which places the first executable allocation at the
+    /// very bottom of the reserved address space and the second one at the
+    /// very top, more than ±2^31 bytes away from the first.
+    struct FarMemoryProvider {
+        space: ReservedAddressSpace,
+        exec_allocs: Vec<(usize, usize)>,
+        heap_allocs: Vec<(usize, Layout)>,
+    }
+
+    impl FarMemoryProvider {
+        fn allocate_heap(&mut self, size: usize, align: u64) -> io::Result<*mut u8> {
+            let align = usize::try_from(align).map_err(io::Error::other)?;
+            let layout =
+                Layout::from_size_align(size.max(1), align.max(1)).map_err(io::Error::other)?;
+            let ptr = unsafe { alloc_zeroed(layout) };
+            if ptr.is_null() {
+                return Err(io::Error::other("JIT allocation failed"));
+            }
+            self.heap_allocs.push((ptr.addr(), layout));
+            Ok(ptr)
+        }
+    }
+
+    impl JITMemoryProvider for FarMemoryProvider {
+        fn allocate_readexec(&mut self, size: usize, align: u64) -> io::Result<*mut u8> {
+            assert!(usize::try_from(align).unwrap() <= self.space.page_size);
+            let len = size
+                .next_multiple_of(self.space.page_size)
+                .max(self.space.page_size);
+            let addr = match self.exec_allocs.len() {
+                0 => self.space.base,
+                1 => self.space.base + self.space.len - len,
+                _ => panic!("expected exactly two executable allocations"),
+            };
+            let result = unsafe {
+                libc::mprotect(
+                    addr as *mut libc::c_void,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            assert_eq!(result, 0);
+            self.exec_allocs.push((addr, len));
+            Ok(addr as *mut u8)
+        }
+
+        fn allocate_readwrite(&mut self, size: usize, align: u64) -> io::Result<*mut u8> {
+            self.allocate_heap(size, align)
+        }
+
+        fn allocate_readonly(&mut self, size: usize, align: u64) -> io::Result<*mut u8> {
+            self.allocate_heap(size, align)
+        }
+
+        unsafe fn free_memory(&mut self) {
+            for (address, layout) in self.heap_allocs.drain(..) {
+                unsafe { dealloc(address as *mut u8, layout) };
+            }
+            // Executable allocations are freed all at once when the reserved
+            // address space is unmapped on drop.
+            self.exec_allocs.clear();
+        }
+
+        fn finalize(&mut self, _branch_protection: BranchProtection) -> ModuleResult<()> {
+            for &(addr, len) in &self.exec_allocs {
+                let result = unsafe {
+                    libc::mprotect(
+                        addr as *mut libc::c_void,
+                        len,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                    )
+                };
+                assert_eq!(result, 0);
+            }
+            Ok(())
+        }
+    }
+
+    let mut builder = JITBuilder::new(default_libcall_names()).unwrap();
+    builder.memory_provider(Box::new(FarMemoryProvider {
+        space: ReservedAddressSpace::new(),
+        exec_allocs: Vec::new(),
+        heap_allocs: Vec::new(),
+    }));
+
+    let mut module = JITModule::new(builder);
+    let mut signature = module.make_signature();
+    signature.returns.push(AbiParam::new(types::I32));
+    let callee = module
+        .declare_function("callee", Linkage::Local, &signature)
+        .unwrap();
+    let caller = module
+        .declare_function("caller", Linkage::Local, &signature)
+        .unwrap();
+
+    // callee: mov eax, 42; ret
+    module
+        .define_function_bytes(callee, 1, &[0xb8, 42, 0, 0, 0, 0xc3], &[])
+        .unwrap();
+
+    // caller: call callee; ret — with the same relocation on the `call`
+    // displacement that `Inst::CallKnown` emits for module-local calls.
+    let relocations = [ModuleReloc {
+        offset: 1,
+        kind: Reloc::X86CallPCRel4,
+        name: ModuleRelocTarget::user(0, callee.as_u32()),
+        addend: -4,
+    }];
+    module
+        .define_function_bytes(caller, 1, &[0xe8, 0, 0, 0, 0, 0xc3], &relocations)
+        .unwrap();
+
+    module.finalize_definitions().unwrap();
+
+    let callee_ptr = module.get_finalized_function(callee);
+    let caller_ptr = module.get_finalized_function(caller);
+
+    // The provider must have placed the two functions out of `rel32` range of
+    // each other for this test to be meaningful.
+    assert!(caller_ptr.addr().abs_diff(callee_ptr.addr()) > i32::MAX as usize);
+
+    // The `call` must have been pointed at a veneer directly behind the six
+    // bytes of code, ...
+    let displacement = unsafe { caller_ptr.byte_add(1).cast::<i32>().read_unaligned() };
+    let veneer = caller_ptr
+        .wrapping_byte_add(5)
+        .wrapping_byte_offset(displacement as isize);
+    assert_eq!(veneer, caller_ptr.wrapping_byte_add(6));
+
+    // ... which consists of `jmp qword ptr [rip]` followed by the absolute
+    // address of `callee`.
+    let veneer_code = unsafe { std::slice::from_raw_parts(veneer, 6) };
+    assert_eq!(veneer_code, [0xff, 0x25, 0, 0, 0, 0]);
+    let veneer_target = unsafe { veneer.byte_add(6).cast::<u64>().read_unaligned() };
+    assert_eq!(veneer_target, callee_ptr.addr() as u64);
+
+    // Most importantly, calling `caller` must actually reach `callee`.
+    let caller_fn: extern "C" fn() -> u32 = unsafe { mem::transmute(caller_ptr) };
+    assert_eq!(caller_fn(), 42);
+
+    unsafe { module.free_memory() };
+}

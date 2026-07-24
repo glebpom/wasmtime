@@ -20,6 +20,34 @@ use alloc::vec::Vec;
 use cranelift_entity::EntityRef as _;
 
 #[test]
+fn test_load_ext_name_near_uses_non_call_relocation() {
+    let flags = settings::Flags::new(settings::builder());
+    let isa_flags = x64::settings::Flags::new(&flags, &x64::settings::builder());
+    let emit_info = EmitInfo::new(flags, isa_flags);
+    let inst = Inst::LoadExtName {
+        dst: Writable::from_reg(Gpr::R11),
+        name: Box::new(ExternalName::User(UserExternalNameRef::new(0))),
+        offset: 0,
+        distance: RelocDistance::Near,
+    };
+    let mut buffer = MachBuffer::new();
+    inst.emit(&mut buffer, &emit_info, &mut Default::default());
+    let buffer = buffer.finish(&Default::default(), &mut Default::default());
+
+    // `lea r11, [rip + 0]` with a relocation on the 4-byte displacement. The
+    // relocation must be `X86PCRel4` rather than `X86CallPCRel4`: this
+    // instruction materializes an address, so consumers must not redirect it
+    // through a call veneer (as e.g. `cranelift-jit` does for out-of-range
+    // `X86CallPCRel4` relocations).
+    assert_eq!(buffer.data(), &[0x4c, 0x8d, 0x1d, 0, 0, 0, 0]);
+    assert_eq!(buffer.relocs().len(), 1);
+    let reloc = &buffer.relocs()[0];
+    assert_eq!(reloc.kind, Reloc::X86PCRel4);
+    assert_eq!(reloc.offset, 3);
+    assert_eq!(reloc.addend, -4);
+}
+
+#[test]
 fn test_x64_emit() {
     let rax = regs::rax();
     let rbx = regs::rbx();

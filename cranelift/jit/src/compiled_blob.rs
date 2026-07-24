@@ -1,6 +1,12 @@
+use std::ptr;
+
 use cranelift_codegen::binemit::Reloc;
 use cranelift_module::ModuleReloc;
 use cranelift_module::ModuleRelocTarget;
+
+/// Size reserved per x86_64 veneer (`jmp qword ptr [rip]` + 8-byte target
+/// address), rounded up to leave room for future changes.
+const VENEER_SIZE: usize = 24;
 
 /// Reads a 32bit instruction at `iptr`, and writes it again after
 /// being altered by `modifier`
@@ -15,6 +21,7 @@ pub(crate) struct CompiledBlob {
     pub(crate) ptr: *mut u8,
     pub(crate) size: usize,
     pub(crate) relocs: Vec<ModuleReloc>,
+    pub(crate) veneer_count: usize,
     #[cfg(feature = "wasmtime-unwinder")]
     pub(crate) exception_data: Option<Vec<u8>>,
 }
@@ -22,11 +29,21 @@ pub(crate) struct CompiledBlob {
 unsafe impl Send for CompiledBlob {}
 
 impl CompiledBlob {
+    pub(crate) fn veneer_allocation_size(size: usize, relocs: &[ModuleReloc]) -> (usize, usize) {
+        let veneer_count = relocs
+            .iter()
+            .filter(|reloc| reloc.kind == Reloc::X86CallPCRel4)
+            .count();
+        (size + veneer_count * VENEER_SIZE, veneer_count)
+    }
+
     pub(crate) fn perform_relocations(
         &self,
         get_address: impl Fn(&ModuleRelocTarget) -> *const u8,
     ) {
         use std::ptr::write_unaligned;
+
+        let mut next_veneer_idx = 0;
 
         for (
             i,
@@ -55,11 +72,44 @@ impl CompiledBlob {
                         write_unaligned(at as *mut u64, u64::try_from(what as usize).unwrap())
                     };
                 }
-                Reloc::X86PCRel4 | Reloc::X86CallPCRel4 => {
+                Reloc::X86PCRel4 => {
                     let base = get_address(name);
                     let what = unsafe { base.offset(isize::try_from(addend).unwrap()) };
                     let pcrel = i32::try_from((what as isize) - (at as isize)).unwrap();
                     unsafe { write_unaligned(at as *mut i32, pcrel) };
+                }
+                Reloc::X86CallPCRel4 => {
+                    // This relocation is applied to the 32-bit displacement of a `call` or
+                    // `jmp` instruction, which is relative to the end of the instruction,
+                    // i.e. 4 bytes past `at`. The addend (always -4 as emitted by the x64
+                    // backend) accounts for this, so the instruction transfers control to
+                    // `what + 4`.
+                    let base = get_address(name);
+                    let what = unsafe { base.offset(isize::try_from(addend).unwrap()) };
+                    if let Ok(pcrel) = i32::try_from((what as isize) - (at as isize)) {
+                        unsafe { write_unaligned(at as *mut i32, pcrel) };
+                    } else {
+                        // The target is out of range for the 32-bit displacement, so
+                        // redirect the call through a veneer at the end of the function:
+                        // `jmp qword ptr [rip]` followed by the absolute target address.
+                        let veneer_idx = next_veneer_idx;
+                        next_veneer_idx += 1;
+                        assert!(veneer_idx < self.veneer_count);
+                        let veneer =
+                            unsafe { self.ptr.byte_add(self.size + veneer_idx * VENEER_SIZE) };
+
+                        let target =
+                            u64::try_from((what as usize).checked_add(4).unwrap()).unwrap();
+                        unsafe {
+                            ptr::copy_nonoverlapping([0xff, 0x25, 0, 0, 0, 0].as_ptr(), veneer, 6);
+                            write_unaligned(veneer.byte_add(6).cast::<u64>(), target);
+                        }
+
+                        // Point the original instruction at the veneer instead; the
+                        // displacement is again relative to the end of the 4-byte field.
+                        let pcrel = i32::try_from((veneer as isize) - (at as isize) - 4).unwrap();
+                        unsafe { write_unaligned(at as *mut i32, pcrel) };
+                    }
                 }
                 Reloc::X86GOTPCRel4 => {
                     panic!("GOT relocation shouldn't be generated when !is_pic");

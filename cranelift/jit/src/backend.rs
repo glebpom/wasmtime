@@ -489,31 +489,32 @@ impl Module for JITModule {
         let align = alignment
             .max(self.isa.function_alignment().minimum as u64)
             .max(self.isa.symbol_alignment());
-        let ptr =
-            self.memory
-                .allocate_readexec(size, align)
-                .map_err(|e| ModuleError::Allocation {
-                    message: "unable to alloc function",
-                    err: e,
-                })?;
+        let relocs = compiled_code
+            .buffer
+            .relocs()
+            .iter()
+            .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, id))
+            .collect::<Vec<_>>();
+        let (allocation_size, veneer_count) = CompiledBlob::veneer_allocation_size(size, &relocs);
+        let ptr = self
+            .memory
+            .allocate_readexec(allocation_size, align)
+            .map_err(|e| ModuleError::Allocation {
+                message: "unable to alloc function",
+                err: e,
+            })?;
 
         {
             let mem = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
             mem.copy_from_slice(compiled_code.code_buffer());
         }
 
-        let relocs = compiled_code
-            .buffer
-            .relocs()
-            .iter()
-            .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, id))
-            .collect();
-
         self.record_function_for_perf(ptr, size, &decl.linkage_name(id));
         self.compiled_functions[id] = Some(CompiledBlob {
             ptr,
             size,
             relocs,
+            veneer_count,
             #[cfg(feature = "wasmtime-unwinder")]
             exception_data: None,
         });
@@ -567,13 +568,14 @@ impl Module for JITModule {
         let align = alignment
             .max(self.isa.function_alignment().minimum as u64)
             .max(self.isa.symbol_alignment());
-        let ptr =
-            self.memory
-                .allocate_readexec(size, align)
-                .map_err(|e| ModuleError::Allocation {
-                    message: "unable to alloc function bytes",
-                    err: e,
-                })?;
+        let (allocation_size, veneer_count) = CompiledBlob::veneer_allocation_size(size, relocs);
+        let ptr = self
+            .memory
+            .allocate_readexec(allocation_size, align)
+            .map_err(|e| ModuleError::Allocation {
+                message: "unable to alloc function bytes",
+                err: e,
+            })?;
 
         unsafe {
             ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, size);
@@ -584,6 +586,7 @@ impl Module for JITModule {
             ptr,
             size,
             relocs: relocs.to_owned(),
+            veneer_count,
             #[cfg(feature = "wasmtime-unwinder")]
             exception_data: None,
         });
@@ -677,6 +680,7 @@ impl Module for JITModule {
             ptr,
             size: init.size(),
             relocs,
+            veneer_count: 0,
             #[cfg(feature = "wasmtime-unwinder")]
             exception_data: None,
         });
