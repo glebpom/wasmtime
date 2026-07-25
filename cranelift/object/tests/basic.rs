@@ -313,7 +313,7 @@ fn x86_64_colocated_symbol_address_uses_non_branch_relocation() {
                 .symbol_value(module.target_config().pointer_type(), data);
             bcx.ins().return_(&[address]);
             bcx.seal_all_blocks();
-            bcx.finalize(module.target_config());
+            bcx.finalize();
         }
         module.define_function(func_id, &mut ctx).unwrap();
 
