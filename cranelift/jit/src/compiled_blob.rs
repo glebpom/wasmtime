@@ -4,9 +4,9 @@ use cranelift_codegen::binemit::Reloc;
 use cranelift_module::ModuleReloc;
 use cranelift_module::ModuleRelocTarget;
 
-/// Size reserved per x86_64 veneer (`jmp qword ptr [rip]` + 8-byte target
-/// address), rounded up to leave room for future changes.
-const VENEER_SIZE: usize = 24;
+/// Size reserved per x86_64 veneer: the 14-byte
+/// `jmp qword ptr [rip]` + 8-byte target address sequence, rounded up to 16.
+const VENEER_SIZE: usize = 16;
 
 /// Reads a 32bit instruction at `iptr`, and writes it again after
 /// being altered by `modifier`
@@ -30,6 +30,8 @@ unsafe impl Send for CompiledBlob {}
 
 impl CompiledBlob {
     pub(crate) fn veneer_allocation_size(size: usize, relocs: &[ModuleReloc]) -> (usize, usize) {
+        // Reserve a worst-case veneer slot for every branch relocation in
+        // case its target is out of range.
         let veneer_count = relocs
             .iter()
             .filter(|reloc| reloc.kind == Reloc::X86CallPCRel4)
