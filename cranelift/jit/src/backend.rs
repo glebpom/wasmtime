@@ -182,6 +182,51 @@ pub struct JITModule {
 }
 
 impl JITModule {
+    /// Ensure that materializing a symbol's address does not assume that the
+    /// JIT memory provider will place the symbol close to the generated code.
+    ///
+    /// Function references can be shared by `call` and `func_addr`
+    /// instructions. Keep the original reference for direct calls, which can
+    /// use veneers when necessary, and give `func_addr` its own far reference.
+    fn use_far_address_relocations(func: &mut ir::Function) {
+        for global_value in func.global_values.values_mut() {
+            if let ir::GlobalValueData::Symbol { colocated, .. } = global_value {
+                *colocated = false;
+            }
+        }
+
+        let func_addr_insts = func
+            .layout
+            .blocks()
+            .flat_map(|block| func.layout.block_insts(block))
+            .filter(|&inst| matches!(func.dfg.insts[inst], ir::InstructionData::FuncAddr { .. }))
+            .collect::<Vec<_>>();
+        let mut far_func_refs = HashMap::new();
+
+        for inst in func_addr_insts {
+            let func_ref = match func.dfg.insts[inst] {
+                ir::InstructionData::FuncAddr { func_ref, .. } => func_ref,
+                _ => unreachable!(),
+            };
+            if !func.dfg.ext_funcs[func_ref].colocated {
+                continue;
+            }
+
+            let far_func_ref = *far_func_refs.entry(func_ref).or_insert_with(|| {
+                let mut ext_func = func.dfg.ext_funcs[func_ref].clone();
+                ext_func.colocated = false;
+                func.dfg.ext_funcs.push(ext_func)
+            });
+
+            match func.dfg.insts[inst] {
+                ir::InstructionData::FuncAddr {
+                    ref mut func_ref, ..
+                } => *func_ref = far_func_ref,
+                _ => unreachable!(),
+            }
+        }
+    }
+
     /// Free memory allocated for code and data segments of compiled functions.
     ///
     /// # Safety
@@ -479,6 +524,8 @@ impl Module for JITModule {
                 decl.linkage_name(id).into_owned(),
             ));
         }
+
+        Self::use_far_address_relocations(&mut ctx.func);
 
         // work around borrow-checker to allow reuse of ctx below
         let res = ctx.compile(self.isa(), ctrl_plane)?;
